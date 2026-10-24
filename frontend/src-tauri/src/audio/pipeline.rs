@@ -117,8 +117,16 @@ impl AudioMixerRingBuffer {
     }
 
     fn can_mix(&self) -> bool {
-        self.mic_buffer.len() >= self.window_size_samples
-            || self.system_buffer.len() >= self.window_size_samples
+        let mic = self.mic_buffer.len();
+        let system = self.system_buffer.len();
+        // Mix only when both sources have a full window. The two capture
+        // streams are independent (e.g. two PulseAudio threads) and arrive with
+        // a phase offset; zero-padding a merely late source inserts periodic
+        // digital silence into the recording. Pad only when one source is
+        // absent or stalled, i.e. the other is more than two windows ahead.
+        let both_ready = mic >= self.window_size_samples && system >= self.window_size_samples;
+        let stall_threshold = self.window_size_samples * 2;
+        both_ready || mic > stall_threshold || system > stall_threshold
     }
 
     fn extract_window(&mut self) -> Option<(Vec<f32>, Vec<f32>)> {
@@ -1231,13 +1239,59 @@ mod mixer_tests {
         assert_eq!(system[window - 1], -((window - 1) as f32));
     }
 
+    /// Regression: two independent PulseAudio streams arrive with a constant
+    /// phase offset. A merely late source must never be zero-padded, otherwise
+    /// the recording gets periodic digital-silence gaps (176ms every 1.2s).
+    #[test]
+    fn ring_buffer_does_not_insert_silence_for_phase_offset_sources() {
+        let mut ring = AudioMixerRingBuffer::new(48_000);
+        let chunk = 512;
+        let offset_chunks = 16; // ~170ms: system lags the microphone
+        let total_chunks = 48_000 * 10 / chunk; // 10s of audio per source
+        let mut system_out = Vec::new();
+        for i in 0..total_chunks + offset_chunks {
+            if i < total_chunks {
+                ring.add_samples(DeviceType::Microphone, vec![0.0; chunk]);
+            }
+            if i >= offset_chunks {
+                ring.add_samples(DeviceType::System, vec![0.5; chunk]);
+            }
+            while ring.can_mix() {
+                if let Some((_, system)) = ring.extract_window() {
+                    system_out.extend(system);
+                }
+            }
+        }
+        assert!(!system_out.is_empty());
+        assert!(
+            system_out.iter().all(|sample| *sample == 0.5),
+            "late system audio was zero-padded: {} silent samples out of {}",
+            system_out.iter().filter(|sample| **sample == 0.0).count(),
+            system_out.len()
+        );
+    }
+
+    #[test]
+    fn ring_buffer_pads_absent_source_once_the_other_is_two_windows_ahead() {
+        let mut ring = AudioMixerRingBuffer::new(48_000);
+        let window = ring.window_size_samples;
+        ring.add_samples(DeviceType::Microphone, vec![1.0; window]);
+        assert!(!ring.can_mix(), "one window alone may just mean system is late");
+        ring.add_samples(DeviceType::Microphone, vec![1.0; window + 1]);
+        let (mic, system) = ring.extract_window().expect("stalled system must not block mic");
+        assert_eq!(mic.len(), window);
+        assert!(system.iter().all(|sample| *sample == 0.0));
+    }
+
     #[test]
     fn ring_buffer_pads_only_when_one_source_is_short() {
         let mut ring = AudioMixerRingBuffer::new(48_000);
         let window = ring.window_size_samples;
-        ring.add_samples(DeviceType::Microphone, vec![1.0; window]);
+        ring.add_samples(DeviceType::Microphone, vec![1.0; window * 2 + 1]);
         ring.add_samples(DeviceType::System, vec![2.0; window / 2]);
-        let (mic, system) = ring.extract_window().expect("mic drives the window");
+        let (mic, system) = ring
+            .extract_window()
+            .expect("mic drives the window once system is stalled");
         assert_eq!(mic.len(), window);
         assert_eq!(system.len(), window);
         assert!(system[window / 2..].iter().all(|sample| *sample == 0.0));
