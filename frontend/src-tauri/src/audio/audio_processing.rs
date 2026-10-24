@@ -1,13 +1,13 @@
 use anyhow::Result;
 use chrono::Utc;
 use log::{debug, info, warn};
+use nnnoiseless::DenoiseState;
 use realfft::num_complex::{Complex32, ComplexFloat};
 use realfft::RealFftPlanner;
 use rubato::{
     Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
 use std::path::PathBuf;
-use nnnoiseless::DenoiseState;
 
 use super::encode::encode_single_audio; // Correct path to encode module
 
@@ -49,9 +49,15 @@ pub fn create_meeting_folder(
     if create_checkpoints_dir {
         let checkpoints_dir = meeting_folder.join(".checkpoints");
         std::fs::create_dir_all(&checkpoints_dir)?;
-        log::info!("Created meeting folder with checkpoints: {}", meeting_folder.display());
+        log::info!(
+            "Created meeting folder with checkpoints: {}",
+            meeting_folder.display()
+        );
     } else {
-        log::info!("Created meeting folder without checkpoints: {}", meeting_folder.display());
+        log::info!(
+            "Created meeting folder without checkpoints: {}",
+            meeting_folder.display()
+        );
     }
 
     Ok(meeting_folder)
@@ -69,7 +75,7 @@ pub fn normalize_v2(audio: &[f32]) -> Vec<f32> {
     }
 
     // Increase target RMS for better voice volume while keeping peak in check
-    let target_rms = 0.9;  // Increased from 0.6
+    let target_rms = 0.9; // Increased from 0.6
     let target_peak = 0.95; // Slightly reduced to prevent clipping
 
     let rms_scaling = target_rms / rms;
@@ -150,6 +156,7 @@ pub struct LoudnessNormalizer {
     gain_linear: f32,
     loudness_buffer: Vec<f32>,
     true_peak_limit: f32,
+    max_positive_gain: f32,
 }
 
 impl LoudnessNormalizer {
@@ -162,8 +169,12 @@ impl LoudnessNormalizer {
         const TRUE_PEAK_LIMIT: f64 = -1.0;
         const ANALYZE_CHUNK_SIZE: usize = 512;
 
-        let ebur128 = ebur128::EbuR128::new(channels, sample_rate, ebur128::Mode::I | ebur128::Mode::TRUE_PEAK)
-            .map_err(|e| anyhow::anyhow!("Failed to create EBU R128 normalizer: {}", e))?;
+        let ebur128 = ebur128::EbuR128::new(
+            channels,
+            sample_rate,
+            ebur128::Mode::I | ebur128::Mode::TRUE_PEAK,
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to create EBU R128 normalizer: {}", e))?;
 
         let true_peak_limit = 10_f32.powf(TRUE_PEAK_LIMIT as f32 / 20.0);
 
@@ -173,6 +184,7 @@ impl LoudnessNormalizer {
             gain_linear: 1.0,
             loudness_buffer: Vec::with_capacity(ANALYZE_CHUNK_SIZE),
             true_peak_limit,
+            max_positive_gain: 10.0f32.powf(6.0 / 20.0),
         })
     }
 
@@ -190,6 +202,8 @@ impl LoudnessNormalizer {
 
         const TARGET_LUFS: f64 = -23.0;
         const ANALYZE_CHUNK_SIZE: usize = 512;
+        const SILENCE_RMS: f32 = 0.00316;
+        const GAIN_SMOOTHING: f32 = 0.20;
 
         let mut normalized_samples = Vec::with_capacity(samples.len());
 
@@ -199,14 +213,19 @@ impl LoudnessNormalizer {
 
             // Analyze loudness every 512 samples
             if self.loudness_buffer.len() >= ANALYZE_CHUNK_SIZE {
-                if let Err(e) = self.ebur128.add_frames_f32(&self.loudness_buffer) {
-                    warn!("Failed to add frames to EBU R128: {}", e);
-                } else {
-                    // Update gain based on cumulative loudness
-                    if let Ok(current_lufs) = self.ebur128.loudness_global() {
+                let block_rms = (self.loudness_buffer.iter().map(|&x| x * x).sum::<f32>()
+                    / self.loudness_buffer.len() as f32)
+                    .sqrt();
+                if block_rms >= SILENCE_RMS {
+                    if let Err(e) = self.ebur128.add_frames_f32(&self.loudness_buffer) {
+                        warn!("Failed to add frames to EBU R128: {}", e);
+                    } else if let Ok(current_lufs) = self.ebur128.loudness_global() {
                         if current_lufs.is_finite() && current_lufs < 0.0 {
-                            let gain_db = TARGET_LUFS - current_lufs;
-                            self.gain_linear = 10_f32.powf(gain_db as f32 / 20.0);
+                            let gain_db = (TARGET_LUFS - current_lufs).clamp(-18.0, 6.0);
+                            let target_gain = 10_f32
+                                .powf(gain_db as f32 / 20.0)
+                                .clamp(1.0 / 10.0f32.powf(18.0 / 20.0), self.max_positive_gain);
+                            self.gain_linear += (target_gain - self.gain_linear) * GAIN_SMOOTHING;
                         }
                     }
                 }
@@ -224,6 +243,60 @@ impl LoudnessNormalizer {
     }
 }
 
+/// Stateful soft expander for stationary microphone noise.
+pub struct SoftNoiseGate {
+    sample_rate: f32,
+    envelope: f32,
+    gain: f32,
+    open: bool,
+}
+
+impl SoftNoiseGate {
+    pub fn new(sample_rate: u32) -> Self {
+        Self {
+            sample_rate: sample_rate as f32,
+            envelope: 0.0,
+            gain: 0.08,
+            open: false,
+        }
+    }
+
+    pub fn process(&mut self, samples: &[f32]) -> Vec<f32> {
+        const OPEN_THRESHOLD: f32 = 0.00562;
+        const CLOSE_THRESHOLD: f32 = 0.00316;
+        const FLOOR_GAIN: f32 = 0.08;
+        const EXPANSION_RATIO: f32 = 2.5;
+        let attack = 1.0 - (-1.0 / (self.sample_rate * 0.010)).exp();
+        let release = 1.0 - (-1.0 / (self.sample_rate * 0.120)).exp();
+        let mut output = Vec::with_capacity(samples.len());
+        for &sample in samples {
+            let level = sample.abs();
+            let coefficient = if level > self.envelope {
+                attack
+            } else {
+                release
+            };
+            self.envelope += (level - self.envelope) * coefficient;
+            if self.open {
+                if self.envelope < CLOSE_THRESHOLD {
+                    self.open = false;
+                }
+            } else if self.envelope >= OPEN_THRESHOLD {
+                self.open = true;
+            }
+            let target = if self.open {
+                1.0
+            } else {
+                FLOOR_GAIN.max((self.envelope / OPEN_THRESHOLD).powf(EXPANSION_RATIO - 1.0))
+            };
+            let gain_coefficient = if target > self.gain { attack } else { release };
+            self.gain += (target - self.gain) * gain_coefficient;
+            output.push(sample * self.gain);
+        }
+        output
+    }
+}
+
 /// RNNoise-based noise suppression processor
 ///
 /// Uses a recurrent neural network to suppress background noise while preserving speech.
@@ -237,7 +310,7 @@ impl LoudnessNormalizer {
 pub struct NoiseSuppressionProcessor {
     denoiser: DenoiseState<'static>,
     frame_buffer: Vec<f32>,
-    frame_size: usize,  // 480 samples at 48kHz = 10ms
+    frame_size: usize, // 480 samples at 48kHz = 10ms
 }
 
 impl NoiseSuppressionProcessor {
@@ -255,7 +328,10 @@ impl NoiseSuppressionProcessor {
 
         const FRAME_SIZE: usize = DenoiseState::FRAME_SIZE;
 
-        info!("Initializing RNNoise noise suppression (frame size: {} samples, 10ms @ 48kHz)", FRAME_SIZE);
+        info!(
+            "Initializing RNNoise noise suppression (frame size: {} samples, 10ms @ 48kHz)",
+            FRAME_SIZE
+        );
 
         Ok(Self {
             denoiser: *DenoiseState::new(),
@@ -365,7 +441,10 @@ impl HighPassFilter {
         let dt = 1.0 / sample_rate_f;
         let alpha = rc / (rc + dt);
 
-        info!("Initializing high-pass filter: cutoff={}Hz @ {}Hz", cutoff_hz, sample_rate);
+        info!(
+            "Initializing high-pass filter: cutoff={}Hz @ {}Hz",
+            cutoff_hz, sample_rate
+        );
 
         Self {
             sample_rate: sample_rate_f,
@@ -413,7 +492,11 @@ pub fn spectral_subtraction(audio: &[f32], d: f32) -> Result<Vec<f32>> {
 
     // If audio is longer than window size, truncate to prevent overflow
     let processed_audio = if audio.len() > window_size {
-        warn!("Audio length {} exceeds window size {}, truncating", audio.len(), window_size);
+        warn!(
+            "Audio length {} exceeds window size {}, truncating",
+            audio.len(),
+            window_size
+        );
         &audio[..window_size]
     } else {
         audio
@@ -523,73 +606,74 @@ pub fn resample(input: &[f32], from_sample_rate: u32, to_sample_rate: u32) -> Re
     let (sinc_len, interpolation_type, oversampling) = if ratio >= 2.0 {
         // Large upsampling (e.g., 8kHz → 16kHz, 16kHz → 48kHz, 24kHz → 48kHz)
         // Needs high quality to avoid artifacts
-        debug!("High-quality upsampling: {}Hz → {}Hz (ratio: {:.2}x)",
-               from_sample_rate, to_sample_rate, ratio);
+        debug!(
+            "High-quality upsampling: {}Hz → {}Hz (ratio: {:.2}x)",
+            from_sample_rate, to_sample_rate, ratio
+        );
         (
-            512,                              // Longer sinc for smoother interpolation
-            SincInterpolationType::Cubic,     // Cubic for best quality
-            512,                              // Higher oversampling
+            512,                          // Longer sinc for smoother interpolation
+            SincInterpolationType::Cubic, // Cubic for best quality
+            512,                          // Higher oversampling
         )
     } else if ratio >= 1.5 {
         // Moderate upsampling (e.g., 32kHz → 48kHz)
-        debug!("Moderate upsampling: {}Hz → {}Hz (ratio: {:.2}x)",
-               from_sample_rate, to_sample_rate, ratio);
-        (
-            384,
-            SincInterpolationType::Cubic,
-            384,
-        )
+        debug!(
+            "Moderate upsampling: {}Hz → {}Hz (ratio: {:.2}x)",
+            from_sample_rate, to_sample_rate, ratio
+        );
+        (384, SincInterpolationType::Cubic, 384)
     } else if ratio > 1.0 {
         // Small upsampling (e.g., 44.1kHz → 48kHz)
-        debug!("Small upsampling: {}Hz → {}Hz (ratio: {:.2}x)",
-               from_sample_rate, to_sample_rate, ratio);
-        (
-            256,
-            SincInterpolationType::Linear,
-            256,
-        )
+        debug!(
+            "Small upsampling: {}Hz → {}Hz (ratio: {:.2}x)",
+            from_sample_rate, to_sample_rate, ratio
+        );
+        (256, SincInterpolationType::Linear, 256)
     } else if ratio <= 0.5 {
         // Large downsampling (e.g., 48kHz → 16kHz, 48kHz → 8kHz)
         // Needs strong anti-aliasing
-        debug!("Anti-aliased downsampling: {}Hz → {}Hz (ratio: {:.2}x)",
-               from_sample_rate, to_sample_rate, ratio);
+        debug!(
+            "Anti-aliased downsampling: {}Hz → {}Hz (ratio: {:.2}x)",
+            from_sample_rate, to_sample_rate, ratio
+        );
         (
-            512,                              // Longer sinc for anti-aliasing
-            SincInterpolationType::Cubic,     // Cubic for quality
+            512,                          // Longer sinc for anti-aliasing
+            SincInterpolationType::Cubic, // Cubic for quality
             512,
         )
     } else {
         // Moderate downsampling (e.g., 48kHz → 24kHz, 48kHz → 32kHz)
-        debug!("Moderate downsampling: {}Hz → {}Hz (ratio: {:.2}x)",
-               from_sample_rate, to_sample_rate, ratio);
-        (
-            384,
-            SincInterpolationType::Linear,
-            384,
-        )
+        debug!(
+            "Moderate downsampling: {}Hz → {}Hz (ratio: {:.2}x)",
+            from_sample_rate, to_sample_rate, ratio
+        );
+        (384, SincInterpolationType::Linear, 384)
     };
 
     let params = SincInterpolationParameters {
         sinc_len,
-        f_cutoff: 0.95,                      // Preserve most of the frequency content
+        f_cutoff: 0.95, // Preserve most of the frequency content
         interpolation: interpolation_type,
         oversampling_factor: oversampling,
-        window: WindowFunction::BlackmanHarris2,  // Best window for audio
+        window: WindowFunction::BlackmanHarris2, // Best window for audio
     };
 
     let mut resampler = SincFixedIn::<f32>::new(
         ratio,
-        2.0,  // Maximum relative deviation
+        2.0, // Maximum relative deviation
         params,
         input.len(),
-        1,    // Mono
+        1, // Mono
     )?;
 
     let waves_in = vec![input.to_vec()];
     let waves_out = resampler.process(&waves_in, None)?;
 
-    debug!("Resampling complete: {} samples → {} samples",
-           input.len(), waves_out[0].len());
+    debug!(
+        "Resampling complete: {} samples → {} samples",
+        input.len(),
+        waves_out[0].len()
+    );
 
     Ok(waves_out.into_iter().next().unwrap())
 }
@@ -614,7 +698,14 @@ pub fn write_audio_to_file(
     device: &str,
     skip_encoding: bool,
 ) -> Result<String> {
-    write_audio_to_file_with_meeting_name(audio, sample_rate, output_path, device, skip_encoding, None)
+    write_audio_to_file_with_meeting_name(
+        audio,
+        sample_rate,
+        output_path,
+        device,
+        skip_encoding,
+        None,
+    )
 }
 
 pub fn write_audio_to_file_with_meeting_name(
@@ -736,4 +827,55 @@ pub fn write_transcript_json_to_file(
     std::fs::write(&file_path, json_string)?;
 
     Ok(file_path.to_string_lossy().to_string())
+}
+
+#[cfg(test)]
+mod processing_tests {
+    use super::*;
+
+    fn rms(samples: &[f32]) -> f32 {
+        (samples.iter().map(|x| x * x).sum::<f32>() / samples.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn soft_gate_attenuates_noise_and_preserves_speech() {
+        let mut gate = SoftNoiseGate::new(48_000);
+        let noise = vec![0.001; 4_800];
+        let gated_noise = gate.process(&noise);
+        assert!(rms(&gated_noise) < rms(&noise) * 0.2);
+
+        let speech = vec![0.08; 4_800];
+        let gated_speech = gate.process(&speech);
+        assert!(rms(&gated_speech) > 0.06);
+    }
+
+    #[test]
+    fn soft_gate_has_release_and_hysteresis() {
+        let mut gate = SoftNoiseGate::new(48_000);
+        let _ = gate.process(&vec![0.08; 2_400]);
+        let release = gate.process(&vec![0.001; 2_400]);
+        assert!(gate.gain < 1.0);
+        assert!(release.iter().any(|sample| sample.abs() > 0.0));
+    }
+
+    #[test]
+    fn silence_is_not_amplified_by_normalizer() {
+        let mut normalizer = LoudnessNormalizer::new(1, 48_000).unwrap();
+        let silence = vec![0.001; 48_000];
+        let output = normalizer.normalize_loudness(&silence);
+        assert!(rms(&output) <= rms(&silence) * 1.1);
+        assert!(output.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn normalizer_positive_gain_is_bounded_and_smooth() {
+        let mut normalizer = LoudnessNormalizer::new(1, 48_000).unwrap();
+        let quiet_speech = vec![0.01; 48_000];
+        let output = normalizer.normalize_loudness(&quiet_speech);
+        assert!(rms(&output) <= 0.021);
+        assert!(output
+            .windows(2)
+            .all(|pair| (pair[1] - pair[0]).abs() < 0.02));
+        assert!(output.iter().all(|x| x.abs() <= 0.891 && x.is_finite()));
+    }
 }

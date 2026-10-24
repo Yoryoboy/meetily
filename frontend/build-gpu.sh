@@ -16,10 +16,11 @@ echo ""
 
 # Export CUDA flags for Linux/NVIDIA
 if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-    export CMAKE_CUDA_ARCHITECTURES=75
+    export CMAKE_CUDA_ARCHITECTURES="${CMAKE_CUDA_ARCHITECTURES:-86}"
     export CMAKE_CUDA_STANDARD=17
     export CMAKE_POSITION_INDEPENDENT_CODE=ON
 fi
+
 
 # Detect OS
 if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -187,4 +188,3 @@ else
   echo -e "${RED}❌ Build failed${NC}"
   exit 1
 fi
-
