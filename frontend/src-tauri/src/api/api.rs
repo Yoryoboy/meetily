@@ -1308,8 +1308,13 @@ pub async fn api_test_custom_openai_connection<R: Runtime>(
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
+    let test_session = uuid::Uuid::new_v4().to_string();
     let mut request = client
         .post(&url)
+        .headers(crate::summary::llm_client::custom_openai_identity_headers(
+            &endpoint,
+            Some(&test_session),
+        ))
         .header("Content-Type", "application/json")
         .json(&test_request);
 
